@@ -17,7 +17,7 @@ class Trainer:
         self.epoch = 0
         self.config=config
         self.lr=self.config.lr
-        self.max_iter=[20000, 20000, 20000, 50000, 50000, 100000, 100000, 100000, 100000]
+        self.max_iter=[10000, 10000, 10000, 50000, 50000, 100000, 100000, 100000, 100000]
         self.G = model.Generator(config)
         self.D = model.Discriminator(config)
         print('Generator structure: ')
@@ -37,8 +37,17 @@ class Trainer:
         self.fixed_z = torch.rand(64,self.config.nz,1,1).to(self.device)
         self.writer = SummaryWriter(config.log_root)
 
-    def train(self):
+    def train(self, train_from):
+        if train_from: 
+            checkpoint = torch.load(config.train_from, map_location=self.device)
+            init_step = checkpoint['Optimizer_G']['state'][0]['step']
         for step in range(2, self.config.max_resl+1):
+            if train_from:
+                if init_step>=self.max_iter[step-2]: 
+                    init_step-=self.max_iter[step-2]
+                    print('init step:{}'.format(init_step))
+                    self.stage_up()
+                    continue
             loader, self.batchsize = DL.data_loader(self.config,self.resl)
             dataloader=iter(loader)
             self.real_label = torch.ones(self.batchsize).to(self.device)
@@ -46,64 +55,71 @@ class Trainer:
             alpha=0.0
             if step==2: alpha=1
             for iters in tqdm(range(0,self.max_iter[step-2])):
-              self.G.to(self.device)
-              self.D.to(self.device)
-              self.G.zero_grad()
-              self.D.zero_grad()
-              try:
-                  self.real_img=next(dataloader)
-              except StopIteration:
-                  dataloader = iter(loader)
-                  self.real_img = next(dataloader)
-              self.real_img = self.real_img.to(self.device)
-              self.z = torch.rand(self.batchsize, self.config.nz).to(self.device)
+                if train_from:
+                    if init_step>=1: 
+                        init_step-=1
+                        continue
+                    elif init_step==0:
+                        self.load(checkpoint)
+                self.G.to(self.device)
+                self.D.to(self.device)
+                self.G.zero_grad()
+                self.D.zero_grad()
+                try:
+                    self.real_img=next(dataloader)
+                except StopIteration:
+                    dataloader = iter(loader)
+                    self.real_img = next(dataloader)
+                self.real_img = self.real_img.to(self.device)
+                self.z = torch.rand(self.batchsize, self.config.nz).to(self.device)
 
-              #update discriminator
-              self.fake_img = self.G(self.z, alpha)
-              self.real_pred = self.D(self.real_img, alpha)
-              self.fake_pred = self.D(self.fake_img.detach(), alpha)
-              if self.config.loss_type=='lsgan':
-                  loss_d = self.gan_loss(self.real_pred, self.real_label)+self.gan_loss(self.fake_pred,self.fake_label)
-              elif self.config.loss_type=='wgan-gp':
-                  beta = torch.rand(self.batchsize, 1, 1, 1).to(self.device)
-                  x_hat = (beta * self.real_img + (1 - beta) * self.fake_img).requires_grad_(True)
-                  x_hat_out = self.D(x_hat, alpha)
-                  loss_d = -self.real_pred.mean() + self.fake_pred.mean() + 10 * self.gradient_penalty(x_hat_out, x_hat)
-              loss_d.backward()
-              self.opt_d.step()
+                #update discriminator
+                self.fake_img = self.G(self.z, alpha)
+                self.real_pred = self.D(self.real_img, alpha)
+                self.fake_pred = self.D(self.fake_img.detach(), alpha)
+                if self.config.loss_type=='lsgan':
+                    loss_d = self.gan_loss(self.real_pred, self.real_label)+self.gan_loss(self.fake_pred,self.fake_label)
+                elif self.config.loss_type=='wgan-gp':
+                    beta = torch.rand(self.batchsize, 1, 1, 1).to(self.device)
+                    x_hat = (beta * self.real_img + (1 - beta) * self.fake_img).requires_grad_(True)
+                    x_hat_out = self.D(x_hat, alpha)
+                    loss_d = -self.real_pred.mean() + self.fake_pred.mean() + 10 * self.gradient_penalty(x_hat_out, x_hat)
+                loss_d.backward()
+                self.opt_d.step()
 
-              #update generator
-              self.fake_img = self.G(self.z, alpha)
-              self.gen_pred = self.D(self.fake_img, alpha)
-              if self.config.loss_type=='lsgan':
-                  loss_g = self.gan_loss(self.gen_pred, self.real_label)
-              elif self.config.loss_type=='wgan-gp':
-                  loss_g = -self.gen_pred.mean()
-              loss_g.backward()
-              self.opt_g.step()
+                #update generator
+                self.fake_img = self.G(self.z, alpha)
+                self.gen_pred = self.D(self.fake_img, alpha)
+                if self.config.loss_type=='lsgan':
+                    loss_g = self.gan_loss(self.gen_pred, self.real_label)
+                elif self.config.loss_type=='wgan-gp':
+                    loss_g = -self.gen_pred.mean()
+                loss_g.backward()
+                self.opt_g.step()
 
-              if iters%self.config.print_loss_iter==0:
-                  print(f"Step: {step} | Iter: {iters} | loss_d: {loss_d.item()}, loss_g: {loss_g.item()}")
-              if iters%self.config.save_params_iter==0:
-                  self.save_model(iters,step)
-              if iters%self.config.save_img_iter==0:
-                  self.save_img(iters,step,alpha)
-              if iters%self.config.save_log_iter==0:
-                  self.writer.add_scalar('loss_g/loss_g', loss_g.item(), iters)
-                  self.writer.add_scalar('loss_d/loss_d', loss_d.item(), iters)
+                if iters%self.config.print_loss_iter==0:
+                    print(f"Step: {step} | Iter: {iters} | loss_d: {loss_d.item()}, loss_g: {loss_g.item()}")
+                if iters%self.config.save_params_iter==0:
+                    self.save_model(iters,step)
+                if iters%self.config.save_img_iter==0:
+                    self.save_img(iters,step,alpha)
+                if iters%self.config.save_log_iter==0:
+                    self.writer.add_scalar('loss_g/loss_g', loss_g.item(), iters)
+                    self.writer.add_scalar('loss_d/loss_d', loss_d.item(), iters)
             if step!=self.config.max_resl: 
                 self.stage_up()
             
-            alpha+=1/(self.max_iter//2)
+            alpha+=1/(self.max_iter[step-2]//2)
             alpha=min(1,alpha)
 
     def stage_up(self):
         self.resl+=1
-        # self.lr=self.lr*self.config.lr_decay
+        self.G=self.G.module
+        self.D=self.D.module
         self.G.stage_up(self.resl)
         self.D.stage_up(self.resl)
-        self.G.to(self.device)
-        self.D.to(self.device)
+        self.G = DataParallel(self.G).to(self.device)
+        self.D = DataParallel(self.D).to(self.device)
 
     def gradient_penalty(self, y, x):
         #Compute gradient penalty: (L2_norm(dy/dx) - 1)**2
@@ -142,8 +158,7 @@ class Trainer:
             imgs = self.G(self.fixed_z[:self.batchsize],alpha)
             save_image(make_grid((0.5*imgs.cpu()+0.5).clamp(0,1)),path)
 
-    def load(self, train_from):
-        checkpoint = torch.load(config.train_from, map_location=self.device)
+    def load(self, checkpoint):
         self.G.load_state_dict(checkpoint['Generator'],strict=False)
         self.D.load_state_dict(checkpoint['Discriminator'],strict=False)
         self.opt_g.load_state_dict(checkpoint['Optimizer_G'])
@@ -154,7 +169,5 @@ if __name__=='__main__':
         print(f'{k}:{v}')
     trainer = Trainer(config)
     if config.train_from:
-        #need to modify
         print(f'Loading checkpoint from {config.train_from}')
-        trainer.load(config.train_from)
-    trainer.train()
+    trainer.train(config.train_from)
